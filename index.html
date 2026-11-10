@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html lang="cs">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PID Dispečink - Živá mapa</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <style>
+        body, html { margin: 0; padding: 0; height: 100%; width: 100%; font-family: 'Segoe UI', Arial, sans-serif; background: #e5e5e5; }
+        #map { width: 100%; height: 100vh; }
+
+        .pid-bus-icon {
+            background: #d4e157;
+            border: 2px solid #9e9d24;
+            border-radius: 50%;
+            color: #000;
+            font-weight: bold;
+            font-size: 13px;
+            text-align: center;
+            line-height: 24px;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.4);
+        }
+
+        .leaflet-popup-content-wrapper { padding: 0; border-radius: 6px; overflow: hidden; background: #fff; box-shadow: 0 4px 15px rgba(0,0,0,0.3); }
+        .leaflet-popup-content { margin: 0; width: 330px !important; }
+
+        .pid-card-header { background: #333; color: #fff; padding: 8px 12px; display: flex; align-items: center; justify-content: space-between; }
+        .pid-card-header .bus-tag { background: #fff; color: #0277bd; font-weight: bold; padding: 2px 8px; border-radius: 12px; font-size: 16px; margin-right: 8px; }
+        .pid-card-header .dest { font-size: 15px; font-weight: bold; text-transform: uppercase; color: #fff; letter-spacing: 0.5px; }
+
+        .pid-delay-bar { background: #c0ca33; color: #000; font-weight: bold; padding: 4px 12px; font-size: 13px; text-align: center; }
+        .pid-delay-bar.late { background: #e53935; color: #fff; }
+
+        .pid-card-body { padding: 10px 14px; font-size: 13px; color: #333; }
+        .pid-card-body .subtitle { font-size: 11px; color: #757575; margin-bottom: 8px; }
+        
+        .pid-grid { display: grid; grid-template-columns: 120px 1fr auto; gap: 4px 6px; align-items: baseline; margin-bottom: 6px; }
+        .pid-grid .lbl { color: #616161; text-align: right; font-size: 12px; white-space: nowrap; }
+        .pid-grid .val { font-weight: bold; color: #212121; }
+        .pid-grid .time { color: #757575; font-size: 12px; text-align: right; }
+
+        .pid-card-footer { padding: 8px 12px; background: #fafafa; border-top: 1px solid #eee; display: flex; gap: 8px; }
+        .pid-btn { background: #e0e0e0; border: none; padding: 6px 14px; border-radius: 4px; font-weight: bold; font-size: 13px; cursor: pointer; color: #424242; }
+        .pid-btn:hover { background: #d6d6d6; }
+
+        /* Jízdní řád modal */
+        #timetable-modal { display: none; position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); width: 400px; max-height: 80vh; background: #222; color: #fff; z-index: 9999; border-radius: 6px; box-shadow: 0 5px 25px rgba(0,0,0,0.6); overflow: hidden; }
+        .tt-header { background: #111; padding: 10px 14px; display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #444; }
+        .tt-header h3 { margin: 0; font-size: 16px; color: #fff; }
+        .tt-close { cursor: pointer; font-weight: bold; font-size: 18px; color: #fff; }
+        .tt-table-head { display: grid; grid-template-columns: 45px 1fr 75px 85px; background: #333; padding: 6px 10px; font-size: 12px; color: #aaa; border-bottom: 1px solid #444; }
+        .tt-body { max-height: 60vh; overflow-y: auto; }
+        .tt-row { display: grid; grid-template-columns: 45px 1fr 75px 85px; padding: 6px 10px; font-size: 13px; border-bottom: 1px solid #333; align-items: center; }
+        .tt-row:nth-child(even) { background: #282828; }
+        .tt-row .real { color: #d4e157; font-weight: bold; }
+    </style>
+</head>
+<body>
+
+    <div id="map"></div>
+
+    <div id="timetable-modal">
+        <div class="tt-header">
+            <h3 id="tt-title">🚌 244 ➔ Přeštínská</h3>
+            <span class="tt-close" onclick="closeTimetable()">✕</span>
+        </div>
+        <div class="tt-table-head">
+            <div>Pásmo</div>
+            <div>Zastávka</div>
+            <div>Jízdní řád</div>
+            <div>Reálně</div>
+        </div>
+        <div class="tt-body" id="tt-list"></div>
+    </div>
+
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script>
+        var map = L.map('map').setView([50.0755, 14.4378], 14);
+
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            maxZoom: 19,
+            attribution: '&copy; OpenStreetMap'
+        }).addTo(map);
+
+        var markers = {};
+        var busDataCache = {};
+        var currentlyOpenModalBusId = null; // Sledování otevřeného JŘ
+        const WORKER_URL = 'https://projektradotinonline.honzasima8994.workers.dev';
+
+        function formatTimeSec(tStr) {
+            if (!tStr || tStr === '--:--' || tStr === '-') return '--:--';
+            return tStr; 
+        }
+
+        function createPidIcon(lineText) {
+            return L.divIcon({
+                className: 'pid-bus-icon',
+                html: lineText || 'BUS',
+                iconSize: [28, 28],
+                iconAnchor: [14, 14]
+            });
+        }
+
+        function generatePopupContent(bus) {
+            let z = bus.zpozdeni || 0;
+            let delayText = z !== 0 ? `Aktuální zpoždění ${z} min.` : `Včas (+0 min.)`;
+            let delayClass = z > 0 ? 'late' : 'ok';
+
+            return `
+                <div class="pid-card-header">
+                    <div><span class="bus-tag">${bus.linka || '244'}</span> <span class="dest">➔ ${bus.smer || 'Sídliště Radotín'}</span></div>
+                </div>
+                <div class="pid-delay-bar ${delayClass}">${delayText}</div>
+                <div class="pid-card-body">
+                    <div class="subtitle">Na základě poslední zprávy z vozidla</div>
+                    <div class="pid-grid">
+                        <span class="lbl">Výchozí zastávka:</span>
+                        <span class="val">${bus.vychoziZastavka || '-'}</span>
+                        <span class="time">${formatTimeSec(bus.vychoziCas)}</span>
+
+                        <span class="lbl">Poslední zastávka:</span>
+                        <span class="val">${bus.posledniZastavka || '-'}</span>
+                        <span class="time">${formatTimeSec(bus.posledniCas)}</span>
+
+                        <span class="lbl">Příští zastávka:</span>
+                        <span class="val" style="color: #d32f2f;">${bus.pristiZastavka || '-'}</span>
+                        <span class="time">${formatTimeSec(bus.pristiCas)}</span>
+                    </div>
+                    <hr style="border:0; border-top:1px solid #eee; margin:8px 0;">
+                    <div class="pid-grid">
+                        <span class="lbl">Dopravce:</span><span class="val" style="grid-column: span 2;">${bus.dopravce || 'DPP'}</span>
+                        <span class="lbl">Typ vozu:</span><span class="val" style="grid-column: span 2;">${bus.typVozu || 'SOR NB 12'}</span>
+                        <span class="lbl">Vůz, oběh:</span><span class="val" style="grid-column: span 2;">#${bus.id} na ${bus.obeh || '244/1'}</span>
+                        <span class="lbl">Řidič:</span><span class="val" style="color: #0277bd; grid-column: span 2;">${bus.ridic || 'Bez řidiče'}</span>
+                    </div>
+                </div>
+                <div class="pid-card-footer">
+                    <button class="pid-btn" onclick="openTimetable('${bus.id}')">Jízdní řád</button>
+                </div>
+            `;
+        }
+
+        function renderTimetable(bus) {
+            document.getElementById('tt-title').innerText = `🚌 ${bus.linka || '244'} ➔ ${bus.smer || 'Sídliště Radotín'}`;
+            let listEl = document.getElementById('tt-list');
+            listEl.innerHTML = '';
+
+            let stops = (bus.jizdniRad && bus.jizdniRad.length > 0) ? bus.jizdniRad : [
+                { pasmo: 'P', nazev: bus.vychoziZastavka || '-', plan: bus.vychoziCas || '--:--', real: '--:--' },
+                { pasmo: 'P', nazev: bus.posledniZastavka || '-', plan: '--:--', real: bus.posledniCas || '--:--' },
+                { pasmo: 'P', nazev: bus.pristiZastavka || '-', plan: '--:--', real: '--:--' }
+            ];
+
+            stops.forEach(st => {
+                let row = document.createElement('div');
+                row.className = 'tt-row';
+                
+                // Reálný čas se aplikuje POUZE na aktuální (poslední) zastávku vozidla!
+                let realTimeDisplay = '--:--';
+                if (st.nazev === bus.posledniZastavka) {
+                    realTimeDisplay = formatTimeSec(bus.posledniCas);
+                }
+
+                row.innerHTML = `
+                    <div>${st.pasmo || 'P'}</div>
+                    <div><b>${st.nazev || '-'}</b></div>
+                    <div>${formatTimeSec(st.plan)}</div>
+                    <div class="real">${realTimeDisplay}</div>
+                `;
+                listEl.appendChild(row);
+            });
+        }
+
+        function updateMap() {
+            fetch(WORKER_URL)
+                .then(res => res.json())
+                .then(dataList => {
+                    if (!Array.isArray(dataList)) return;
+
+                    let activeIds = [];
+
+                    dataList.forEach(bus => {
+                        if (bus.active === false) {
+                            if (markers[bus.id]) {
+                                map.removeLayer(markers[bus.id]);
+                                delete markers[bus.id];
+                            }
+                            return;
+                        }
+
+                        activeIds.push(bus.id);
+                        busDataCache[bus.id] = bus;
+
+                        let popupContent = generatePopupContent(bus);
+
+                        if (markers[bus.id]) {
+                            markers[bus.id].setLatLng([bus.lat, bus.lng]);
+                            // Živá aktualizace obsahu otevřeného popupu
+                            if (markers[bus.id].isPopupOpen()) {
+                                markers[bus.id].setPopupContent(popupContent);
+                            }
+                        } else {
+                            markers[bus.id] = L.marker([bus.lat, bus.lng], { icon: createPidIcon(bus.linka) })
+                                .addTo(map)
+                                .bindPopup(popupContent);
+                        }
+                    });
+
+                    // Živá aktualizace otevřeného modálního okna jízdního řádu
+                    if (currentlyOpenModalBusId && busDataCache[currentlyOpenModalBusId]) {
+                        renderTimetable(busDataCache[currentlyOpenModalBusId]);
+                    }
+
+                    for (let id in markers) {
+                        if (!activeIds.includes(id)) {
+                            map.removeLayer(markers[id]);
+                            delete markers[id];
+                        }
+                    }
+                })
+                .catch(err => console.error('Chyba načítání dat:', err));
+        }
+
+        function openTimetable(busId) {
+            currentlyOpenModalBusId = busId;
+            let bus = busDataCache[busId];
+            if (!bus) return;
+
+            renderTimetable(bus);
+            document.getElementById('timetable-modal').style.display = 'block';
+        }
+
+        function closeTimetable() {
+            currentlyOpenModalBusId = null;
+            document.getElementById('timetable-modal').style.display = 'none';
+        }
+
+        // Automatická aktualizace každou 1 sekundu (živě bez nutnosti refreshu)
+        setInterval(updateMap, 1000);
+        updateMap();
+    </script>
+</body>
+</html>
